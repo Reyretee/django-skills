@@ -1,4 +1,4 @@
-# Django Rest Framework (DRF) best practices for serializers, views, viewsets, routers, authentication, permissions, throttling, pagination, filtering, versioning, and performance.
+# Django Rest Framework (DRF) best practices for serializers, validators, relations, views, viewsets, routers, error handling, status codes, the request object, authentication, permissions, throttling, pagination, filtering, versioning, renderers, OpenAPI schemas, caching, performance, and testing.
 
 ## Serializers
 
@@ -29,8 +29,8 @@ class ProductSerializer(serializers.ModelSerializer):
     class Meta:
         model = Product
         fields = ['id', 'name', 'price', 'category', 'category_name',
-                  'discounted_price', 'is_active']
-        read_only_fields = ['id']
+                  'discounted_price', 'is_active', 'created_at']
+        read_only_fields = ['created_at']  # id is already read-only by default
 
     def get_discounted_price(self, obj):
         if obj.sale_price:
@@ -58,27 +58,75 @@ class UserSerializer(serializers.ModelSerializer):
 **Correct:**
 ```python
 from rest_framework import serializers
+from rest_framework.validators import UniqueValidator
 from django.contrib.auth import get_user_model
 
 User = get_user_model()
 
 
 class UserSerializer(serializers.ModelSerializer):
+    email = serializers.EmailField(
+        required=True,
+        validators=[UniqueValidator(queryset=User.objects.all())],
+    )
+
     class Meta:
         model = User
         fields = ['id', 'username', 'email', 'date_joined']
-        read_only_fields = ['id', 'date_joined']
-        extra_kwargs = {
-            'email': {'required': True},
-        }
-
-    def validate_email(self, value):
-        if User.objects.filter(email=value).exclude(pk=self.instance.pk if self.instance else None).exists():
-            raise serializers.ValidationError('Email already in use.')
-        return value
+        read_only_fields = ['date_joined']
 ```
 
-> **Why:** Never use `fields = '__all__'` — it exposes internal fields. List fields explicitly. Use `extra_kwargs` for field-level overrides and `validate_<field>` for custom validation.
+> **Why:** Never use `fields = '__all__'` — it exposes internal fields. List fields explicitly. Use `UniqueValidator` instead of a manual `.exists()` check in `validate_email` — the manual check is race-prone and forgets to exclude the current instance on updates; `UniqueValidator` handles both automatically.
+
+## Validators
+
+### Built-in validators and object-level validation
+
+**Wrong:**
+```python
+from rest_framework import serializers
+from .models import Booking
+
+class BookingSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Booking
+        fields = ['room', 'date', 'start_time', 'end_time']
+
+    def validate_room(self, value):
+        # Manual duplicate check — race-prone, misses updates
+        if Booking.objects.filter(room=value, date=self.initial_data.get('date')).exists():
+            raise serializers.ValidationError('Room already booked.')
+        return value
+    # Cross-field check (start < end) crammed into a field validator
+    # where the other field may not be available yet
+```
+
+**Correct:**
+```python
+from rest_framework import serializers
+from rest_framework.validators import UniqueTogetherValidator
+from .models import Booking
+
+
+class BookingSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Booking
+        fields = ['room', 'date', 'start_time', 'end_time']
+        validators = [
+            UniqueTogetherValidator(
+                queryset=Booking.objects.all(),
+                fields=['room', 'date'],
+            ),
+        ]
+
+    def validate(self, data):
+        # Object-level validation — all fields available together
+        if data['start_time'] >= data['end_time']:
+            raise serializers.ValidationError('start_time must be before end_time.')
+        return data
+```
+
+> **Why:** Use `UniqueValidator` for single-field uniqueness and `UniqueTogetherValidator` for composite uniqueness — both exclude the current instance on updates automatically. Cross-field checks belong in object-level `validate()`, where all deserialized fields are available. Note: `ModelSerializer` auto-generates `UniqueValidator`s from model fields with `unique=True`, so don't duplicate them.
 
 ## Nested Serializers
 
@@ -104,6 +152,7 @@ class OrderSerializer(serializers.ModelSerializer):
 
 **Correct:**
 ```python
+from django.db import transaction
 from rest_framework import serializers
 from .models import Order, OrderItem
 
@@ -132,13 +181,59 @@ class OrderWriteSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         items_data = validated_data.pop('items')
-        order = Order.objects.create(**validated_data)
-        for item_data in items_data:
-            OrderItem.objects.create(order=order, **item_data)
+        with transaction.atomic():
+            order = Order.objects.create(**validated_data)
+            OrderItem.objects.bulk_create(
+                OrderItem(order=order, **item_data) for item_data in items_data
+            )
         return order
 ```
 
-> **Why:** Use separate serializers for read (nested, rich) and write (flat, writable). Override `create()`/`update()` for writable nested serializers since DRF doesn't handle them automatically.
+> **Why:** Use separate serializers for read (nested, rich) and write (flat, writable). Override `create()`/`update()` for writable nested serializers since DRF doesn't handle them automatically. Wrap multi-object writes in `transaction.atomic()` — otherwise a failure mid-loop leaves an order with half its items — and use `bulk_create` to insert all items in one query.
+
+## Serializer Relations
+
+### Choosing the right related field
+
+**Wrong:**
+```python
+from rest_framework import serializers
+from .models import Product
+
+class ProductSerializer(serializers.ModelSerializer):
+    # read_only relation used where the client needs to WRITE the category
+    category = serializers.StringRelatedField()
+
+    class Meta:
+        model = Product
+        fields = ['id', 'name', 'category']
+    # POST/PUT with a category now fails — StringRelatedField is read-only
+```
+
+**Correct:**
+```python
+from rest_framework import serializers
+from .models import Category, Product
+
+
+class ProductSerializer(serializers.ModelSerializer):
+    # Writable by pk — queryset= is REQUIRED for writable relations
+    category = serializers.PrimaryKeyRelatedField(
+        queryset=Category.objects.all(),
+        html_cutoff=100,  # Cap browsable-API dropdown size
+    )
+    # Writable by natural key instead of pk
+    # category = serializers.SlugRelatedField(
+    #     slug_field='slug', queryset=Category.objects.all())
+    # Read-only human-readable label (uses the model's __str__)
+    category_label = serializers.StringRelatedField(source='category', read_only=True)
+
+    class Meta:
+        model = Product
+        fields = ['id', 'name', 'category', 'category_label']
+```
+
+> **Why:** `PrimaryKeyRelatedField` is the default and fastest; `SlugRelatedField` accepts natural keys; `StringRelatedField` is always read-only. Writable relations require `queryset=` — it's how DRF validates the incoming value. Watch the browsable API: relation fields render as a `<select>` of the *entire* queryset, which can fetch thousands of rows per page load — cap it with `html_cutoff`.
 
 ## Views (APIView and Generics)
 
@@ -187,6 +282,133 @@ class ProductDetailView(generics.RetrieveUpdateDestroyAPIView):
 ```
 
 > **Why:** Generic views handle serialization, pagination, status codes, and error responses. Use `APIView` only when generics don't fit your use case.
+
+## Error Handling & Exceptions
+
+### raise_exception and a consistent error envelope
+
+**Wrong:**
+```python
+from rest_framework.views import APIView
+from rest_framework.response import Response
+
+class ProductCreateView(APIView):
+    def post(self, request):
+        serializer = ProductSerializer(data=request.data)
+        # Manual branching — every view reinvents error formatting
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data, status=201)
+        return Response({'oops': serializer.errors}, status=400)
+        # Inconsistent error shape across endpoints
+```
+
+**Correct:**
+```python
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+
+class ProductCreateView(APIView):
+    def post(self, request):
+        serializer = ProductSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)  # 400 handled by DRF
+        serializer.save()
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+# For a consistent error envelope API-wide, wrap the default handler:
+# exceptions.py
+from rest_framework.views import exception_handler
+
+def custom_exception_handler(exc, context):
+    response = exception_handler(exc, context)
+    if response is not None:
+        response.data = {
+            'error': {
+                'status_code': response.status_code,
+                'detail': response.data,
+            }
+        }
+    return response
+
+# settings.py
+REST_FRAMEWORK = {
+    'EXCEPTION_HANDLER': 'apps.core.exceptions.custom_exception_handler',
+}
+```
+
+> **Why:** `is_valid(raise_exception=True)` lets DRF's exception handler produce the 400 response — no manual branching, and every endpoint fails with the same shape. A custom `EXCEPTION_HANDLER` gives one place to define your error envelope. Caveat: it only catches DRF's `APIException` subclasses plus Django's `Http404` and `PermissionDenied` — any other unhandled exception is still a plain 500.
+
+## Status Codes
+
+### Named constants over magic numbers
+
+**Wrong:**
+```python
+from rest_framework.response import Response
+
+def post(self, request):
+    ...
+    return Response(serializer.data, status=201)  # Magic number
+
+def destroy(self, request, pk=None):
+    ...
+    return Response(status=204)  # What was 204 again?
+```
+
+**Correct:**
+```python
+from rest_framework import status
+from rest_framework.response import Response
+
+def post(self, request):
+    ...
+    return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+def destroy(self, request, pk=None):
+    ...
+    return Response(status=status.HTTP_204_NO_CONTENT)
+```
+
+> **Why:** `status.HTTP_201_CREATED` reads as intent; `201` requires the reader to know the HTTP spec by heart. The constants also prevent typos (`status=200` vs `status=201` on create) from slipping through review, and `status.is_success()` / `is_client_error()` helpers make test assertions clearer.
+
+## The Request Object
+
+### request.data over request.POST
+
+**Wrong:**
+```python
+from rest_framework.views import APIView
+
+class ProductView(APIView):
+    def put(self, request):
+        # request.POST only contains form data from POST requests —
+        # empty for JSON payloads and for PUT/PATCH entirely
+        name = request.POST.get('name')
+
+    def get(self, request):
+        category = request.GET.get('category')  # Works, but not DRF-idiomatic
+```
+
+**Correct:**
+```python
+from rest_framework.views import APIView
+
+class ProductView(APIView):
+    def put(self, request):
+        # request.data parses JSON, form, and multipart —
+        # and works for POST, PUT, and PATCH
+        name = request.data.get('name')
+
+    def get(self, request):
+        # query_params is the DRF-idiomatic (and better named) alias
+        category = request.query_params.get('category')
+        # request.user  → authenticated user (or AnonymousUser)
+        # request.auth  → token/credential the user authenticated with
+```
+
+> **Why:** `request.POST` only handles form-encoded POST bodies; `request.data` handles any parser (JSON, multipart) and any method (POST/PUT/PATCH). Use `request.query_params` instead of `request.GET` — the name is accurate (query params arrive on any method). `request.user` and `request.auth` are populated by the authentication classes.
 
 ## ViewSets
 
@@ -241,6 +463,92 @@ class ProductViewSet(viewsets.ModelViewSet):
 
 > **Why:** ViewSets combine list/create/retrieve/update/destroy into one class. Use `get_permissions()` to vary permissions per action. `@action` adds custom endpoints.
 
+### Exposing only the actions you need
+
+**Wrong:**
+```python
+from rest_framework import viewsets
+
+class CategoryViewSet(viewsets.ModelViewSet):
+    queryset = Category.objects.all()
+    serializer_class = CategorySerializer
+    # Categories are managed in the admin — yet this exposes
+    # POST/PUT/PATCH/DELETE endpoints nobody asked for
+```
+
+**Correct:**
+```python
+from rest_framework import viewsets, mixins
+
+
+# Read-only resource: list + retrieve only
+class CategoryViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = Category.objects.all()
+    serializer_class = CategorySerializer
+
+
+# Custom combination: create + list, no update/delete
+class FeedbackViewSet(mixins.CreateModelMixin,
+                      mixins.ListModelMixin,
+                      viewsets.GenericViewSet):
+    queryset = Feedback.objects.all()
+    serializer_class = FeedbackSerializer
+
+
+# Per-action serializers
+class OrderViewSet(viewsets.ModelViewSet):
+    queryset = Order.objects.all()
+
+    def get_serializer_class(self):
+        if self.action in ['create', 'update', 'partial_update']:
+            return OrderWriteSerializer
+        return OrderReadSerializer
+```
+
+> **Why:** `ModelViewSet` exposes all six CRUD actions — don't ship write endpoints you don't need. Use `ReadOnlyModelViewSet` for read-only resources, or compose `GenericViewSet` with mixins for exact control. `get_serializer_class()` keyed on `self.action` pairs naturally with the read/write serializer split.
+
+## Binding the Request User
+
+### Never accept the user from the client payload
+
+**Wrong:**
+```python
+class OrderSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Order
+        fields = ['id', 'user', 'items', 'total']
+        # 'user' is writable — a client can POST {"user": 42, ...}
+        # and create orders on behalf of ANY user (mass assignment / IDOR)
+```
+
+**Correct:**
+```python
+class OrderSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Order
+        fields = ['id', 'user', 'items', 'total']
+        read_only_fields = ['user']
+
+
+class OrderViewSet(viewsets.ModelViewSet):
+    serializer_class = OrderSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return Order.objects.filter(user=self.request.user)
+
+    def perform_create(self, serializer):
+        # Bind the authenticated user server-side
+        serializer.save(user=self.request.user)
+
+
+# Alternative — bind inside the serializer itself:
+class OrderSerializer(serializers.ModelSerializer):
+    user = serializers.HiddenField(default=serializers.CurrentUserDefault())
+```
+
+> **Why:** A writable `user` field lets any client create or reassign records to arbitrary users — a classic mass-assignment/IDOR vulnerability. Bind the user server-side via `perform_create(serializer.save(user=self.request.user))`, or use `HiddenField(default=CurrentUserDefault())` if you want the serializer self-contained (it also makes the value available to validators).
+
 ## Routers
 
 ### Auto-generating URL patterns for ViewSets
@@ -277,28 +585,33 @@ urlpatterns = [
 
 ## Authentication
 
-### JWT for stateless API authentication
+### Choosing authentication per client type
 
 **Wrong:**
 ```python
-# Using SessionAuthentication for a mobile API
+# Reflexively reaching for JWT because "sessions are old"
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': [
-        'rest_framework.authentication.SessionAuthentication',
-        # Session auth requires cookies — doesn't work for mobile/SPA
+        'rest_framework_simplejwt.authentication.JWTAuthentication',
     ],
 }
+# ...then storing the JWT in localStorage on the frontend,
+# where any XSS payload can read and exfiltrate it
 ```
 
 **Correct:**
 ```python
-# pip install djangorestframework-simplejwt
+# Choose auth per client type:
+# - Same-origin SPA or server-rendered pages → SessionAuthentication
+#   (HttpOnly cookie, not readable by JS — often SAFER than JWT)
+# - Simple first-party mobile/script clients → rest_framework.authentication.TokenAuthentication
+# - Cross-origin SPAs, mobile, microservices → JWT (simplejwt)
 
 # settings.py
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': [
         'rest_framework_simplejwt.authentication.JWTAuthentication',
-        'rest_framework.authentication.SessionAuthentication',  # For browsable API
+        'rest_framework.authentication.SessionAuthentication',  # Browsable API + same-origin
     ],
 }
 
@@ -318,7 +631,7 @@ urlpatterns = [
 ]
 ```
 
-> **Why:** JWT is stateless — works for mobile, SPAs, and microservices. Keep access tokens short-lived (30 min) and use refresh tokens for renewal. Session auth is fine for the browsable API.
+> **Why:** There is no one-size-fits-all auth. `SessionAuthentication` is fine — often safer — for same-origin SPAs because the session cookie is HttpOnly; a JWT in localStorage is readable by any injected script (XSS liability). DRF's built-in `TokenAuthentication` covers simple first-party clients without extra dependencies. Gotcha: `SessionAuthentication` enforces CSRF — unsafe methods (POST/PUT/DELETE) return 403 unless the client sends the CSRF token. If you do use JWT, keep access tokens short-lived and rotate refresh tokens.
 
 ## Permissions
 
@@ -363,7 +676,45 @@ class OrderDetailView(generics.RetrieveUpdateAPIView):
     serializer_class = OrderSerializer
 ```
 
-> **Why:** Set `IsAuthenticated` as the global default. Create custom permissions for object-level checks. DRF checks all permission classes — all must return True.
+> **Why:** Set `IsAuthenticated` as the global default. Create custom permissions for object-level checks. When listed in `permission_classes`, every class must return True (implicit AND) — but since DRF 3.9 you can also compose them with `|`, `&`, and `~` for OR/AND/NOT logic.
+
+### Composing permissions and the list-view gotcha
+
+**Wrong:**
+```python
+class ProductViewSet(viewsets.ModelViewSet):
+    # Wants "read for anyone, write for admins" — but a list of classes
+    # is AND logic, so this requires BOTH, blocking reads for non-admins
+    permission_classes = [IsAuthenticatedOrReadOnly, IsAdminUser]
+
+
+class DocumentViewSet(viewsets.ModelViewSet):
+    queryset = Document.objects.all()  # ALL documents
+    permission_classes = [IsOwner]     # has_object_permission checks obj.owner
+    # List view still returns everyone's documents —
+    # has_object_permission NEVER runs for list
+```
+
+**Correct:**
+```python
+from rest_framework.permissions import IsAuthenticatedOrReadOnly, IsAdminUser
+
+
+class ProductViewSet(viewsets.ModelViewSet):
+    # OR composition: anonymous reads pass, admin writes pass
+    permission_classes = [IsAuthenticatedOrReadOnly | IsAdminUser]
+
+
+class DocumentViewSet(viewsets.ModelViewSet):
+    serializer_class = DocumentSerializer
+    permission_classes = [IsAuthenticated, IsOwner]
+
+    def get_queryset(self):
+        # Scope the queryset — this is what protects list views
+        return Document.objects.filter(owner=self.request.user)
+```
+
+> **Why:** Since DRF 3.9, permissions compose with `|`, `&`, and `~` — use OR to express "either role suffices" instead of writing a custom class. Critical caveat: `has_object_permission` only runs for detail routes (via `get_object()`); list views never call it. Object-level permissions cannot filter a list — scope `get_queryset()` to the requesting user instead.
 
 ## Throttling
 
@@ -402,6 +753,54 @@ class LoginView(APIView):
 ```
 
 > **Why:** Throttling prevents abuse and brute-force attacks. Set lower rates for anonymous users and sensitive endpoints (login, password reset). DRF stores throttle state in the cache.
+
+### Throttling caveats in production
+
+**Wrong:**
+```python
+# Relying on DRF throttling as the security layer, with default config
+REST_FRAMEWORK = {
+    'DEFAULT_THROTTLE_CLASSES': ['rest_framework.throttling.AnonRateThrottle'],
+    'DEFAULT_THROTTLE_RATES': {'anon': '100/hour'},
+}
+# Behind a load balancer: AnonRateThrottle keys on REMOTE_ADDR,
+# which is the PROXY's IP — all anonymous users share one bucket
+# With LocMemCache and 4 gunicorn workers: each worker counts separately
+```
+
+**Correct:**
+```python
+# settings.py
+REST_FRAMEWORK = {
+    'DEFAULT_THROTTLE_CLASSES': [
+        'rest_framework.throttling.AnonRateThrottle',
+        'rest_framework.throttling.UserRateThrottle',
+    ],
+    'DEFAULT_THROTTLE_RATES': {
+        'anon': '100/hour',
+        'user': '1000/hour',
+        'password-reset': '5/hour',
+    },
+    'NUM_PROXIES': 1,  # Behind one load balancer — trust X-Forwarded-For one hop
+}
+
+# Throttle state MUST live in a shared cache across processes/hosts
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.redis.RedisCache',
+        'LOCATION': 'redis://cache:6379/1',
+    },
+}
+
+# ScopedRateThrottle: per-endpoint rates without custom classes
+from rest_framework.throttling import ScopedRateThrottle
+
+class PasswordResetView(APIView):
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'password-reset'
+```
+
+> **Why:** DRF throttling is a soft application-level guard, not a security measure — a determined attacker needs to be stopped at the edge (CDN/WAF/nginx rate limits). Behind proxies, set `NUM_PROXIES` or every anonymous client is keyed on the proxy's IP and shares one bucket. Throttle counters live in the cache: with `LocMemCache`, each worker process keeps its own counts, so multi-process deployments need Redis/Memcached. `ScopedRateThrottle` gives per-endpoint rates via `throttle_scope`.
 
 ## Pagination
 
@@ -533,6 +932,95 @@ class ProductViewSet(viewsets.ModelViewSet):
 
 > **Why:** URL-based versioning (`/api/v1/`, `/api/v2/`) is the most explicit and easiest for API consumers. Switch serializers per version to evolve the API without breaking clients.
 
+## Renderers & Parsers
+
+### JSON-only in production, browsable API in DEBUG
+
+**Wrong:**
+```python
+# Default settings shipped to production — BrowsableAPIRenderer stays on,
+# rendering a full HTML page (with forms and dropdowns) for browser requests
+REST_FRAMEWORK = {}
+```
+
+**Correct:**
+```python
+# settings.py
+REST_FRAMEWORK = {
+    'DEFAULT_RENDERER_CLASSES': [
+        'rest_framework.renderers.JSONRenderer',
+    ],
+    'DEFAULT_PARSER_CLASSES': [
+        'rest_framework.parsers.JSONParser',
+    ],
+}
+
+if DEBUG:
+    REST_FRAMEWORK['DEFAULT_RENDERER_CLASSES'].append(
+        'rest_framework.renderers.BrowsableAPIRenderer',
+    )
+
+# File uploads need multipart parsing — enable per-view
+from rest_framework.parsers import MultiPartParser, FormParser
+
+class AvatarUploadView(APIView):
+    parser_classes = [MultiPartParser, FormParser]
+
+    def put(self, request):
+        file = request.data['avatar']
+        ...
+```
+
+> **Why:** The browsable API is a great development tool but a liability in production: it leaks endpoint structure, renders relation dropdowns (extra queries), and adds template-rendering overhead. Serve JSON only in production and enable `BrowsableAPIRenderer` under `DEBUG`. For file uploads, add `MultiPartParser` on the specific view instead of globally.
+
+## OpenAPI Schemas
+
+### drf-spectacular over the deprecated built-in generation
+
+**Wrong:**
+```python
+# DRF's built-in schema generation (CoreAPI/AutoSchema) is deprecated
+from rest_framework.schemas import get_schema_view
+
+urlpatterns = [
+    path('openapi/', get_schema_view(title='My API', version='1.0.0')),
+]
+```
+
+**Correct:**
+```python
+# pip install drf-spectacular
+
+# settings.py
+INSTALLED_APPS = [..., 'drf_spectacular']
+REST_FRAMEWORK = {
+    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
+}
+SPECTACULAR_SETTINGS = {
+    'TITLE': 'My API',
+    'VERSION': '1.0.0',
+}
+
+# urls.py
+from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
+
+urlpatterns = [
+    path('api/schema/', SpectacularAPIView.as_view(), name='schema'),
+    path('api/docs/', SpectacularSwaggerView.as_view(url_name='schema')),
+]
+
+# Refine per-view documentation where introspection isn't enough
+from drf_spectacular.utils import extend_schema
+
+class ProductViewSet(viewsets.ModelViewSet):
+    @extend_schema(responses=ProductSerializer, summary='Archive a product')
+    @action(detail=True, methods=['post'])
+    def archive(self, request, pk=None):
+        ...
+```
+
+> **Why:** DRF's built-in schema generation is deprecated and produces incomplete OpenAPI output. drf-spectacular is the community-standard replacement: it introspects serializers, pagination, and filters automatically, ships Swagger/Redoc UIs, and `@extend_schema` fills the gaps (custom actions, non-standard responses).
+
 ## SerializerMethodField Security
 
 ### Conditionally exposing sensitive data
@@ -613,9 +1101,101 @@ class OrderViewSet(viewsets.ModelViewSet):
             Order.objects
             .select_related('customer')
             .prefetch_related('items__product')
+            # WARNING: .only() must cover every field the serializer touches.
+            # Accessing a deferred field triggers an extra query PER ROW —
+            # worse than not using .only() at all.
             .only('id', 'total', 'status', 'created_at',
                   'customer__id', 'customer__name')
         )
 ```
 
-> **Why:** Optimize `get_queryset()` with `select_related` for FK/O2O, `prefetch_related` for M2M/reverse FK, and `only()` to limit fetched columns. Profile with Django Debug Toolbar.
+> **Why:** Optimize `get_queryset()` with `select_related` for FK/O2O, `prefetch_related` for M2M/reverse FK, and `only()` to limit fetched columns. Caveat: `.only()` must stay in lockstep with the serializer's `fields` — if the serializer reads a deferred field, Django silently fetches it with one extra query per row, turning an optimization into an N+1. Profile with Django Debug Toolbar.
+
+## Caching
+
+### Caching API responses without leaking data across users
+
+**Wrong:**
+```python
+from django.views.decorators.cache import cache_page
+from django.utils.decorators import method_decorator
+
+class OrderViewSet(viewsets.ModelViewSet):
+    @method_decorator(cache_page(60 * 5))
+    def list(self, request, *args, **kwargs):
+        # Response is keyed by URL only — user A's orders
+        # get served from cache to user B
+        return super().list(request, *args, **kwargs)
+```
+
+**Correct:**
+```python
+from django.views.decorators.cache import cache_page
+from django.views.decorators.vary import vary_on_headers
+from django.utils.decorators import method_decorator
+
+
+class ProductViewSet(viewsets.ReadOnlyModelViewSet):
+    # Public, identical for everyone — safe to cache by URL
+    @method_decorator(cache_page(60 * 15))
+    def list(self, request, *args, **kwargs):
+        return super().list(request, *args, **kwargs)
+
+
+class OrderViewSet(viewsets.ModelViewSet):
+    # Per-user data — vary the cache key on the auth credential
+    @method_decorator(cache_page(60 * 2))
+    @method_decorator(vary_on_headers('Authorization'))
+    def list(self, request, *args, **kwargs):
+        return super().list(request, *args, **kwargs)
+```
+
+> **Why:** DRF views work with Django's `cache_page`, applied via `method_decorator` on the handler method. `cache_page` keys on the URL — for authenticated endpoints you must add `vary_on_headers('Authorization')` (or `'Cookie'` for session auth) so each credential gets its own cache entry, otherwise one user's cached response is served to everyone. Keep TTLs short for data that changes.
+
+## Testing APIs
+
+### APITestCase with force_authenticate and named routes
+
+**Wrong:**
+```python
+from django.test import TestCase
+
+class ProductAPITest(TestCase):
+    def test_create_product(self):
+        # Hand-rolling token plumbing just to test a view
+        response = self.client.post('/api/token/', {'username': 'u', 'password': 'p'})
+        token = response.json()['access']
+        response = self.client.post(
+            '/api/v1/products/',  # Hardcoded URL breaks when routes change
+            data='{"name": "Widget"}',
+            content_type='application/json',
+            HTTP_AUTHORIZATION=f'Bearer {token}',
+        )
+        self.assertEqual(response.status_code, 201)  # Magic number
+```
+
+**Correct:**
+```python
+from django.urls import reverse
+from rest_framework import status
+from rest_framework.test import APITestCase
+
+
+class ProductAPITest(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user('staff', password='x', is_staff=True)
+
+    def test_create_product(self):
+        # Skip token plumbing entirely — auth is not what's under test
+        self.client.force_authenticate(user=self.user)
+        url = reverse('product-list')  # Router basename, not a hardcoded path
+        response = self.client.post(url, {'name': 'Widget', 'price': '9.99'})
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['name'], 'Widget')
+
+    def test_anonymous_cannot_create(self):
+        response = self.client.post(reverse('product-list'), {'name': 'Widget'})
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+```
+
+> **Why:** `APITestCase` provides an `APIClient` that speaks JSON natively and offers `force_authenticate()` — testing your endpoint's behavior shouldn't require exercising the token flow too. `reverse('product-list')` / `reverse('product-detail', args=[pk])` use the router's basename, so URL changes don't break tests. Assert against `response.data` (parsed) and `status.HTTP_*` constants. For testing a view in full isolation (no URLconf, no middleware), use `APIRequestFactory` and call the view directly.

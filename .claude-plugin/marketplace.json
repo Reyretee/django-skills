@@ -1,0 +1,14 @@
+{
+  "name": "django-skills",
+  "owner": {
+    "name": "Ahmet Can Dinçer",
+    "url": "https://github.com/ahmetcdincer"
+  },
+  "plugins": [
+    {
+      "name": "django-skills",
+      "source": "./",
+      "description": "Django best practices skill, senior Django developer agent, and slash commands for reviewing, securing, and optimizing Django projects."
+    }
+  ]
+}

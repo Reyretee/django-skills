@@ -149,6 +149,32 @@ class ArticleCreateView(CreateView):
 
 > **Why:** `reverse_lazy()` delays URL resolution until first access. Use it in class attributes and module-level code. `reverse()` is fine inside functions/methods that run at request time.
 
+## reverse() with Query Strings and Fragments (Django 5.2+)
+
+**Wrong:**
+```python
+from urllib.parse import quote
+from django.urls import reverse
+
+# Manual string-building — easy to get encoding wrong
+url = f"{reverse('search')}?q={quote(q)}&page=2#results"
+# Forget quote() on one value and 'a&b', 'c++', or unicode breaks the URL
+```
+
+**Correct:**
+```python
+from django.urls import reverse, reverse_lazy
+
+url = reverse('search', query={'q': 'django', 'page': 2}, fragment='results')
+# /search/?q=django&page=2#results — values URL-encoded for you
+
+class DraftListView(ListView):
+    # Works in reverse_lazy() too
+    success_url = reverse_lazy('articles:list', query={'status': 'draft'})
+```
+
+> **Why:** The `query` and `fragment` arguments (Django 5.2+) handle URL encoding correctly, including special characters and multi-value parameters. Manual f-string concatenation is a recurring source of encoding bugs.
+
 ## URL Parameters and Custom Converters
 
 **Wrong:**

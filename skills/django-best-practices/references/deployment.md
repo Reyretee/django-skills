@@ -385,6 +385,33 @@ urlpatterns = [
 
 > **Why:** Load balancers need a health endpoint to route traffic. Check the database connection at minimum. Return 503 when unhealthy so the load balancer stops sending traffic.
 
+## Error Monitoring
+
+### Capturing exceptions when DEBUG=False
+
+**Wrong:**
+```python
+# DEBUG=False with no monitoring — errors return a bare 500 page and vanish;
+# you learn about outages from angry users
+DEBUG = False
+```
+
+**Correct:**
+```python
+# pip install sentry-sdk
+
+# settings/production.py
+import sentry_sdk
+
+sentry_sdk.init(
+    dsn=env('SENTRY_DSN'),
+    traces_sample_rate=0.1,  # Sample 10% of transactions for performance data
+    send_default_pii=False,
+)
+```
+
+> **Why:** With `DEBUG=False` you are blind without error monitoring — Sentry (or an equivalent like Rollbar or self-hosted GlitchTip) captures the traceback, request data, and release info for every unhandled exception. Pair it with proper logging configuration — see `references/logging.md`.
+
 ## Django Debug Toolbar
 
 ### Development-only profiling setup
@@ -611,18 +638,35 @@ DATABASES = {
 
 **Correct:**
 ```python
-# Option 1: Django 5.1+ built-in connection pooling
+# Option 1: Native connection pooling (Django 5.1+)
+# Requires psycopg 3 with the pool extra: pip install "psycopg[binary,pool]"
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.postgresql',
         'NAME': 'mydb',
         'OPTIONS': {
-            'pool': True,  # Django 5.1+
+            'pool': {
+                'min_size': 2,
+                'max_size': 4,
+                'timeout': 10,
+            },
         },
+        # Don't combine 'pool' with CONN_MAX_AGE — the pool manages
+        # connection lifetimes itself
     }
 }
 
-# Option 2: PgBouncer (external connection pooler)
+# Option 2: Persistent connections via CONN_MAX_AGE (any Django version)
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': 'mydb',
+        'CONN_MAX_AGE': 60,          # Keep connections open for 60s
+        'CONN_HEALTH_CHECKS': True,  # Verify the connection before reuse
+    }
+}
+
+# Option 3: PgBouncer (external connection pooler)
 # pgbouncer.ini:
 # [databases]
 # mydb = host=127.0.0.1 port=5432 dbname=mydb
@@ -640,7 +684,43 @@ DATABASES = {
 }
 ```
 
-> **Why:** Connection pooling reuses database connections instead of opening/closing per request. Django 5.1+ has built-in pooling. PgBouncer is the standard external pooler for PostgreSQL.
+> **Why:** Connection pooling reuses database connections instead of opening/closing per request. Native pooling (Django 5.1+, psycopg 3 with `psycopg[pool]`) keeps warm connections inside each worker process — a modern complement or alternative to PgBouncer, which pools across many app servers. Pick one strategy per database: never combine `pool` with `CONN_MAX_AGE`.
+
+## SQLite in Production
+
+### Tuning SQLite for concurrent writes
+
+**Wrong:**
+```python
+# Default SQLite settings under concurrent writes
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': BASE_DIR / 'db.sqlite3',
+    }
+}
+# Rollback-journal mode: writers block readers — "database is locked" errors
+```
+
+**Correct:**
+```python
+# Django 5.1+ OPTIONS for the small-scale SQLite-in-production pattern
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': BASE_DIR / 'db.sqlite3',
+        'OPTIONS': {
+            'init_command': (
+                'PRAGMA journal_mode=WAL;'
+                'PRAGMA busy_timeout=5000;'
+            ),
+            'transaction_mode': 'IMMEDIATE',
+        },
+    }
+}
+```
+
+> **Why:** WAL mode lets readers proceed while a write is in progress, `busy_timeout` makes writers wait for the lock instead of failing immediately, and `IMMEDIATE` transactions take the write lock up front to avoid mid-transaction lock errors. This makes single-server SQLite viable for modest production workloads.
 
 ## Async Views (Django 4.1+)
 

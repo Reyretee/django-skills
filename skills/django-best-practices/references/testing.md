@@ -85,6 +85,43 @@ class ViewTest(TestCase):
 
 > **Why:** `Client` tests the full stack (middleware, URL resolution, templates). `RequestFactory` creates bare request objects for testing views in isolation — faster for unit tests.
 
+## Client query_params and HTML Assertions (Django 5.1+)
+
+**Wrong:**
+```python
+class SearchViewTest(TestCase):
+    def test_search(self):
+        # Hand-building query strings — encoding bugs with spaces and special chars
+        response = self.client.get('/items/?q=' + query)
+
+    def test_item_removed_from_page(self):
+        response = self.client.get('/items/')
+        # Fragile substring check — breaks on whitespace or attribute order
+        self.assertNotIn('<li>Widget</li>', response.content.decode())
+```
+
+**Correct:**
+```python
+class SearchViewTest(TestCase):
+    def test_search(self):
+        # query_params handles URL encoding (Django 5.1+)
+        response = self.client.get('/items/', query_params={'q': 'blue widget'})
+        self.assertEqual(response.status_code, 200)
+
+    def test_post_with_query_params(self):
+        # Works for POST too — query string stays separate from the body
+        response = self.client.post(
+            '/items/', {'name': 'Widget'}, query_params={'ref': 'promo'}
+        )
+
+    def test_item_removed_from_page(self):
+        response = self.client.get('/items/')
+        # HTML-aware negative assertion (Django 5.1+)
+        self.assertNotInHTML('<li>Widget</li>', response.content.decode())
+```
+
+> **Why:** `query_params` URL-encodes values for you and, on POST/PUT, keeps query string arguments cleanly separate from the request body. `assertNotInHTML` parses the HTML, so it isn't fooled by whitespace or attribute ordering the way substring checks are.
+
 ## Fixtures
 
 **Wrong:**
@@ -286,6 +323,40 @@ class OrderServiceTest(TestCase):
 ```
 
 > **Why:** Mock external services (SMS, payments, APIs) to keep tests fast and deterministic. Use Django's `locmem` email backend to capture emails in tests.
+
+## Asserting Query Counts
+
+**Wrong:**
+```python
+def test_product_list(self):
+    response = self.client.get('/products/')
+    self.assertEqual(response.status_code, 200)
+    # Passes even if the view runs 300 queries (N+1) —
+    # performance regressions slip through unnoticed
+```
+
+**Correct:**
+```python
+from django.db import connection
+from django.test import TestCase
+from django.test.utils import CaptureQueriesContext
+
+
+class ProductListTest(TestCase):
+    def test_list_query_count(self):
+        # Fails if the view runs more (or fewer) than 3 queries
+        with self.assertNumQueries(3):
+            self.client.get('/products/')
+
+    def test_cached_path_skips_db(self):
+        self.client.get('/products/')  # Warm the cache
+        with CaptureQueriesContext(connection) as ctx:
+            self.client.get('/products/')
+        # The cached code path must hit the DB zero times
+        self.assertEqual(len(ctx.captured_queries), 0)
+```
+
+> **Why:** `assertNumQueries` turns N+1 regressions into test failures instead of production incidents. `CaptureQueriesContext` records the actual SQL so you can inspect it or assert a cached path never touches the database; for app-wide auditing, `connection.execute_wrapper()` can hook every query.
 
 ## Test Coverage and Targets
 

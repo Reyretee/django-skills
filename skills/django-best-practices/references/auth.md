@@ -374,6 +374,77 @@ class ArticleUpdateView(LoginRequiredMixin, PermissionRequiredMixin, UpdateView)
 
 > **Why:** Mixins must come before the view class in the inheritance chain (MRO). They handle redirect-to-login and 403 responses automatically.
 
+### LoginRequiredMiddleware (Django 5.1+)
+
+**Wrong:**
+```python
+# Protecting views one by one — one forgotten view is an open door
+class ArticleListView(LoginRequiredMixin, ListView):
+    model = Article
+
+class ArticleDetailView(LoginRequiredMixin, DetailView):
+    model = Article
+
+class ExportView(View):  # Oops — forgot the mixin, now it's public
+    def get(self, request):
+        return generate_sensitive_export()
+```
+
+**Correct:**
+```python
+# settings.py — Django 5.1+ makes authentication the default for ALL views
+MIDDLEWARE = [
+    # ...
+    'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'django.contrib.auth.middleware.LoginRequiredMiddleware',  # After AuthenticationMiddleware
+    # ...
+]
+```
+
+```python
+# Opt OUT the few public views instead of opting in every private one
+from django.contrib.auth.decorators import login_not_required
+
+
+@login_not_required
+def landing_page(request):
+    return render(request, 'landing.html')
+
+
+@login_not_required
+def health_check(request):
+    return JsonResponse({'status': 'ok'})
+```
+
+> **Why:** For sites where most views require login, `LoginRequiredMiddleware` inverts the default — everything is protected, and public views are explicitly marked with `@login_not_required`. A forgotten decorator now fails closed (login redirect) instead of open (data leak). Note: the middleware respects `login_url` and `redirect_field_name` set via `@login_required`, but NOT the attributes set on `LoginRequiredMixin` — configure those views with the decorator if they need custom redirect behavior.
+
+### Async Authentication (Django 5.1+)
+
+**Wrong:**
+```python
+# Blocking the event loop in an async view
+async def profile(request):
+    user = request.user  # Sync lazy attribute — triggers a blocking DB query
+    ...
+```
+
+**Correct:**
+```python
+from django.contrib.auth.decorators import login_required
+
+
+@login_required  # Supports async views natively in Django 5.1+
+async def profile(request):
+    user = await request.auser()  # Async user access — no blocking query
+    return render(request, 'profile.html', {'user': user})
+
+
+# Async manager methods on the user model
+user = await User.objects.acreate_user(email='a@example.com', password='...')
+```
+
+> **Why:** In async views, use `await request.auser()` instead of `request.user` to avoid blocking database access. Django 5.1+ adds async support to `@login_required` and async variants like `acreate_user`. See references/async.md for the full async patterns.
+
 ## 11. Sessions & Cookies
 
 ### Session Middleware Configuration

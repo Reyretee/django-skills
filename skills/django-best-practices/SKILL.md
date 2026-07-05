@@ -15,7 +15,7 @@ allowed-tools: Read Write Edit Bash(python:*) Bash(pip:*)
 
 # Django Best Practices
 
-A senior Django developer's knowledge base covering 27 topics — from ORM queries to deployment. This skill provides wrong vs correct code examples and architectural guidance for building production-grade Django applications.
+A senior Django developer's knowledge base covering 28 topic areas — from ORM queries to deployment, current through Django 6.0. This skill provides wrong vs correct code examples and architectural guidance for building production-grade Django applications.
 
 ## When to use this skill
 
@@ -30,11 +30,13 @@ A senior Django developer's knowledge base covering 27 topics — from ORM queri
 - Writing or reviewing tests (Django TestCase, pytest, factories)
 - Working with Django signals, forms, templates, or template tags
 - Configuring static/media files, file uploads, or storage backends
-- Setting up Celery tasks, periodic tasks, or background jobs
+- Setting up background jobs (Celery or Django 6.0's native django.tasks)
 - Deploying Django (Gunicorn, Nginx, Docker, CI/CD)
 - Working with Django Channels or WebSockets
+- Writing async views or using the async ORM
 - Implementing i18n/l10n or timezone support
-- Reviewing code for security issues (CSRF, XSS, SQL injection)
+- Reviewing code for security issues (CSRF, XSS, SQL injection, CSP)
+- Paginating querysets, sending email, configuring logging, or flash messages
 - Designing app architecture, service layers, or project structure
 
 ## Workflow
@@ -59,6 +61,8 @@ When this skill is activated, follow these steps:
 
 ### Models & ORM
 - Use `DecimalField` for money, `BooleanField` for flags, `EmailField` for emails.
+- Never `null=True` on `CharField`/`TextField` — use `blank=True` alone for optional strings.
+- Use `TextChoices`/`IntegerChoices` for enumerated fields — never magic strings.
 - Always set explicit `related_name` on ForeignKey and OneToOneField.
 - Use `select_related` for ForeignKey/OneToOne, `prefetch_related` for ManyToMany/reverse FK.
 - Use `F()` expressions for atomic updates to avoid race conditions.
@@ -92,7 +96,13 @@ When this skill is activated, follow these steps:
 - Never use f-strings in raw SQL — always parameterize.
 - Use Argon2 for password hashing, PBKDF2 as fallback.
 - Set `SECURE_SSL_REDIRECT`, `SECURE_HSTS_*`, and cookie security flags in production.
+- Configure a Content Security Policy (`SECURE_CSP`, built-in since Django 6.0).
+- Use `django.core.signing` for expiring tokens — never hand-rolled hashes.
+- Rate-limit login and move the admin off `/admin/` on internet-facing sites.
 - Run `manage.py check --deploy` before every deployment.
+
+### Auth
+- Prefer `LoginRequiredMiddleware` (Django 5.1+) with `@login_not_required` opt-outs over per-view mixins — secure by default.
 
 ### Admin
 - Always configure `list_display`, `list_filter`, and `search_fields`.
@@ -153,6 +163,15 @@ When this skill is activated, follow these steps:
 - Always implement retry logic with exponential backoff.
 - Make tasks idempotent — safe to run more than once.
 - Use `@shared_task` instead of importing the Celery app directly.
+- Consider Django 6.0's native `django.tasks` before adding Celery for simple offloading.
+- Enqueue from inside transactions via `transaction.on_commit()`.
+
+### Everyday Essentials
+- Paginate with `paginator.get_page()` and always `order_by()` first; preserve filters in links with `{% querystring %}`.
+- Send email from background tasks with per-environment backends; always include a plain-text part.
+- Configure `LOGGING` with `disable_existing_loggers: False` and use module-level `getLogger(__name__)` — never `print()`.
+- Use the messages framework with the post/redirect/get pattern for user feedback.
+- Pin dependencies with a lock file (pip-tools/uv); commit the compiled output.
 
 ## Reference Files
 
@@ -166,9 +185,11 @@ Read the relevant reference file before writing code for that topic.
 | Migrations | `references/migrations.md` | Creating migrations, data migrations, squashing, zero-downtime schema changes |
 | Django Admin | `references/admin.md` | Configuring admin, inline models, custom actions, fieldsets, admin security/performance |
 | Views | `references/views.md` | Writing FBVs or CBVs, generic views, mixins, choosing between FBV and CBV |
+| Pagination | `references/pagination.md` | Paginating querysets, page links that keep filters, keyset pagination, AsyncPaginator |
 | URL routing | `references/urls.md` | Configuring URLs, namespaces, path converters, reverse/reverse_lazy |
 | Templates | `references/templates.md` | Template inheritance, tags, filters, custom template tags, context processors, security |
 | Forms | `references/forms.md` | Django forms, ModelForms, validation, custom validators, formsets, file upload security |
+| Messages | `references/messages.md` | Flash messages after form submissions, SuccessMessageMixin, message levels and rendering |
 | Authentication & sessions | `references/auth.md` | User models, auth backends, login/logout, password reset, permissions, groups, sessions, cookies |
 | Middleware | `references/middleware.md` | Middleware order, custom middleware, exception handling, async middleware |
 | Static & media files | `references/static-media.md` | Static/media configuration, collectstatic, WhiteNoise, S3/CDN, file uploads, storage backends |
@@ -178,8 +199,11 @@ Read the relevant reference file before writing code for that topic.
 | Internationalization | `references/i18n.md` | i18n settings, gettext/gettext_lazy, translation tags, timezone support, locale structure |
 | Testing | `references/testing.md` | TestCase types, Client/RequestFactory, fixtures, pytest-django, factory_boy, mocking, coverage |
 | Django REST Framework | `references/drf.md` | Serializers, viewsets, routers, authentication, permissions, throttling, pagination, filtering |
-| Background tasks | `references/celery.md` | Celery setup, task definition, retries, queues, periodic tasks, Django-Q, Huey, idempotency |
+| Background tasks | `references/celery.md` | Celery setup, Django 6.0 native tasks (django.tasks), task definition, retries, queues, periodic tasks, idempotency |
+| Sending email | `references/email.md` | send_mail, HTML email, per-environment backends, bulk sending, header injection |
+| Logging | `references/logging.md` | LOGGING config, built-in loggers, production error visibility, Sentry, what not to log |
+| Async Django | `references/async.md` | Async views, async ORM (aget/acreate), sync_to_async, async auth/sessions, when async pays off |
 | Deployment & performance | `references/deployment.md` | Gunicorn, Nginx, Docker, CI/CD, zero-downtime deploys, query optimization, indexing, async views |
 | Django Channels | `references/channels.md` | ASGI setup, WebSocket consumers, channel layers, group messaging, WS authentication, SSE |
-| Django ecosystem | `references/ecosystem.md` | DRF, django-filter, allauth, debug toolbar, storages, guardian, import-export, unfold, django-redis |
+| Django ecosystem | `references/ecosystem.md` | DRF, django-filter, allauth, debug toolbar, storages, guardian, import-export, unfold, django-redis, sitemaps, syndication feeds, redirects |
 | Architecture patterns | `references/architecture.md` | Custom fields, multi-DB, database routers, Jinja2, ORM internals, MTV, service layer, DDD, SOLID |

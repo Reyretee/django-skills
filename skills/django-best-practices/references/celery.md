@@ -1,4 +1,4 @@
-# Background task best practices covering Celery setup, task definition, retries, routing, periodic tasks, Django-Q, Huey, Django 6.0 built-in tasks, and idempotency.
+# Background task best practices covering Celery setup, Django 6.0 native tasks (django.tasks), task definition, retries, routing, periodic tasks, Django-Q, Huey, and idempotency.
 
 ## Celery Setup and Configuration
 
@@ -41,6 +41,121 @@ CELERY_TIMEZONE = 'UTC'
 ```
 
 > **Why:** `config_from_object` with `namespace='CELERY'` reads all `CELERY_*` settings from Django settings. `autodiscover_tasks` finds `tasks.py` in each installed app automatically.
+
+## Django 6.0 Native Tasks (django.tasks)
+
+### Configuring the right backend per environment
+
+**Wrong:**
+```python
+# Shipping the built-in backend to production and expecting background work
+TASKS = {
+    'default': {
+        'BACKEND': 'django.tasks.backends.immediate.ImmediateBackend',
+    }
+}
+# ImmediateBackend executes the task inline, in-process, during enqueue() —
+# nothing is offloaded, no queue, no worker. Fine for dev, useless in production.
+```
+
+**Correct:**
+```python
+# settings/dev.py — run tasks inline so failures surface immediately
+TASKS = {
+    'default': {'BACKEND': 'django.tasks.backends.immediate.ImmediateBackend'},
+}
+
+# settings/test.py — record enqueued tasks without executing them
+TASKS = {
+    'default': {'BACKEND': 'django.tasks.backends.dummy.DummyBackend'},
+}
+
+# tests.py — assert against the dummy backend
+from django.tasks import default_task_backend
+
+def test_signup_enqueues_welcome_email(self):
+    self.client.post('/signup/', data)
+    result = default_task_backend.results[0]  # results sit in READY state
+    assert result.task.name == 'send_welcome_email'
+    default_task_backend.clear()
+
+# settings/production.py — a third-party backend with a durable queue + worker,
+# e.g. the django-tasks reference package's database backend
+TASKS = {
+    'default': {'BACKEND': 'django_tasks.backends.database.DatabaseBackend'},
+}
+```
+
+> **Why:** Django 6.0 ships the tasks *interface* plus two dev-oriented backends: ImmediateBackend runs tasks inline (dev and integration tests), DummyBackend stores results in READY state so tests can assert on `backend.results`. Production offloading requires a third-party backend that provides a durable queue and a worker process.
+
+### Defining, enqueueing, and reading results
+
+**Wrong:**
+```python
+from myapp.tasks import send_welcome_email
+
+def register(request):
+    send_welcome_email(user.id)  # Calling the function directly — runs synchronously
+    send_welcome_email.enqueue(user.id)  # Or discarding the result — no way to check status
+```
+
+**Correct:**
+```python
+# myapp/tasks.py
+from django.tasks import task
+
+@task(priority=10, queue_name='emails')
+def send_welcome_email(user_id): ...
+
+@task(takes_context=True)
+def sync_account(context, account_id):
+    if context.attempt > 1:  # Context exposes retry metadata
+        logger.warning('Retrying account sync, attempt %s', context.attempt)
+
+
+# views.py
+result = send_welcome_email.enqueue(user.id)          # Sync view
+result = await send_welcome_email.aenqueue(user.id)   # Async view
+
+# Per-call override without redefining the task
+send_welcome_email.using(priority=20, queue_name='urgent').enqueue(user.id)
+
+# Result API
+result.id            # Unique id — store it to check on the task later
+result.status        # READY / RUNNING / SUCCESSFUL / FAILED
+result.refresh()     # Re-fetch state from the backend (or await result.arefresh())
+result.return_value  # Available once SUCCESSFUL
+result.errors        # On failure: each error has .exception_class and .traceback
+```
+
+> **Why:** `@task()` turns a plain function into an enqueueable task; `enqueue()`/`aenqueue()` return a result handle rather than running inline. `takes_context=True` injects a context object (attempt number, task result) and `.using()` overrides priority or queue per call.
+
+### Enqueue after commit with JSON-serializable arguments
+
+**Wrong:**
+```python
+from django.db import transaction
+
+def place_order(request):
+    with transaction.atomic():
+        order = Order.objects.create(...)
+        process_order.enqueue(order)  # Model instances aren't JSON-serializable — rejected
+        process_order.enqueue(order.pk)  # Still wrong: the worker may pick this up
+        # before COMMIT, and the row won't exist yet
+```
+
+**Correct:**
+```python
+from functools import partial
+from django.db import transaction
+
+def place_order(request):
+    with transaction.atomic():
+        order = Order.objects.create(...)
+        transaction.on_commit(partial(process_order.enqueue, order.pk))
+```
+
+> **Why:** Task arguments and return values must be JSON-serializable — tuples come back as lists, and model instances or datetimes are rejected outright — the same "pass IDs, not instances" rule as Celery. `transaction.on_commit` guarantees the row is visible before any worker runs the task. Define tasks in each app's `tasks.py`. Reach for django.tasks for simple offloading with a supported backend; Celery remains the choice for complex routing, rate limits, canvas/chains, and Beat schedules until the native framework matures.
 
 ## Task Definition
 
@@ -243,7 +358,7 @@ async_task('myapp.tasks.process_order', order.id,
            hook='myapp.tasks.order_processed_callback')
 ```
 
-> **Why:** Django-Q (django-q2 fork) is simpler than Celery — no separate broker config needed if you use Redis as Django's cache. Good for projects that don't need Celery's full feature set.
+> **Why:** Django-Q (django-q2 fork) is simpler than Celery — no separate broker config needed if you use Redis as Django's cache. Good for projects that don't need Celery's full feature set. On Django 6.0+, also weigh the native django.tasks framework (see above) before adding a third-party queue.
 
 ## Huey Lightweight Alternative
 
@@ -285,49 +400,7 @@ def cleanup():
 # Start: python manage.py run_huey
 ```
 
-> **Why:** Huey is a lightweight alternative to Celery — single dependency, simple config. `immediate=True` in development runs tasks synchronously. Great for small-to-medium projects.
-
-## Django 6.0 Built-in Tasks
-
-### Using Django's native task system for simple use cases
-
-**Wrong:**
-```python
-# Django 6.0+ — still using Celery just for simple fire-and-forget tasks
-# when the built-in task system would suffice
-```
-
-**Correct:**
-```python
-# Django 6.0+ — built-in background tasks
-# settings.py
-TASKS = {
-    'default': {
-        'BACKEND': 'django.tasks.backends.database.DatabaseBackend',
-    }
-}
-
-# tasks.py
-from django.tasks import task
-
-@task()
-def send_welcome_email(user_id):
-    from myapp.models import User
-    user = User.objects.get(pk=user_id)
-    # send email...
-
-# Usage in views
-from .tasks import send_welcome_email
-
-def register(request):
-    user = User.objects.create(...)
-    send_welcome_email.enqueue(user.id)
-    return redirect('home')
-
-# Run worker: python manage.py taskworker
-```
-
-> **Why:** Django 6.0+ includes a built-in task system that eliminates the need for Celery in simple cases. Database backend requires no extra infrastructure. Use Celery when you need advanced features like routing and priorities.
+> **Why:** Huey is a lightweight alternative to Celery — single dependency, simple config. `immediate=True` in development runs tasks synchronously. Great for small-to-medium projects; on Django 6.0+ the native django.tasks framework covers similar simple cases without an extra dependency.
 
 ## Task Idempotency
 

@@ -62,6 +62,12 @@ You are a senior Django developer with deep expertise in Django, Django REST Fra
 4. Use `Exists()` instead of `.count() > 0` for existence checks.
 5. Use `bulk_create`/`bulk_update` for batch operations.
 
+## When Writing Background Tasks or Async Code
+
+1. Read `references/celery.md` (Celery and Django 6.0's native `django.tasks`) or `references/async.md` before writing task or async code.
+2. Pass IDs to tasks, never model instances; enqueue via `transaction.on_commit()`.
+3. Never call blocking I/O or the sync ORM inside an `async def` view.
+
 ## When Writing Tests
 
 1. Read `references/testing.md` before writing tests.
@@ -80,6 +86,8 @@ Before completing any task, verify:
 - No hardcoded `SECRET_KEY` — must come from environment variables
 - HTTPS settings configured for production (`SECURE_SSL_REDIRECT`, `SECURE_HSTS_*`, cookie flags)
 - `DEBUG = False` in production with `ALLOWED_HOSTS` set
+- Content Security Policy configured (`SECURE_CSP`, built-in since Django 6.0)
+- Login endpoints rate-limited on internet-facing sites
 
 ## Workflow
 

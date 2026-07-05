@@ -1,4 +1,4 @@
-Django ecosystem reference covering essential third-party packages: DRF, django-filter, allauth, debug toolbar, storages, channels, celery results, guardian, import-export, unfold, environ, redis, and Pillow.
+Django ecosystem reference covering essential third-party packages (DRF, django-filter, allauth, debug toolbar, storages, channels, celery results, guardian, import-export, unfold, environ, redis, Pillow) and built-in contrib apps people tend to reinvent (sitemaps, syndication feeds, redirects).
 
 ## 25. Django Ecosystem
 
@@ -411,3 +411,103 @@ class Photo(models.Model):
 ```
 
 > **Why:** Pillow is required for `ImageField`. It validates that uploaded files are actual images and provides image processing (resize, crop, format conversion).
+
+### Sitemaps (django.contrib.sitemaps)
+
+**Wrong:**
+```python
+# Hand-writing sitemap.xml as a static file or a manual view
+def sitemap_view(request):
+    urls = [f"<url><loc>https://example.com{p.get_absolute_url()}</loc></url>"
+            for p in Post.objects.all()]
+    return HttpResponse(f"<urlset>{''.join(urls)}</urlset>",
+                        content_type="application/xml")
+    # No lastmod, wrong namespace, regenerated on every request
+```
+
+**Correct:**
+```python
+# settings.py
+INSTALLED_APPS = [..., 'django.contrib.sitemaps', 'django.contrib.sites']
+
+# sitemaps.py
+from django.contrib.sitemaps import Sitemap
+from blog.models import Post
+
+class PostSitemap(Sitemap):
+    changefreq = 'weekly'
+    priority = 0.6
+
+    def items(self):
+        return Post.objects.filter(status=Post.Status.PUBLISHED)
+
+    def lastmod(self, obj):
+        return obj.updated_at
+
+# urls.py
+from django.contrib.sitemaps.views import sitemap
+from django.views.decorators.cache import cache_page
+
+sitemaps = {'posts': PostSitemap}
+urlpatterns = [
+    path('sitemap.xml', cache_page(3600)(sitemap), {'sitemaps': sitemaps},
+         name='django.contrib.sitemaps.views.sitemap'),
+]
+```
+
+> **Why:** The sitemaps framework generates a correct, namespaced sitemap.xml from your querysets, uses `get_absolute_url()` and `lastmod` automatically, and paginates past 50,000 URLs. Cache the view — search engine crawlers hit it repeatedly.
+
+### Syndication Feeds (django.contrib.syndication)
+
+**Wrong:**
+```python
+# Building RSS XML by hand with string templates
+def rss_view(request):
+    items = ''.join(f'<item><title>{p.title}</title></item>'
+                    for p in Post.objects.all()[:20])  # Unescaped titles → broken XML
+    return HttpResponse(f'<rss><channel>{items}</channel></rss>')
+```
+
+**Correct:**
+```python
+from django.contrib.syndication.views import Feed
+from blog.models import Post
+
+class LatestPostsFeed(Feed):
+    title = 'My Blog'
+    link = '/blog/'
+    description = 'Latest posts.'
+
+    def items(self):
+        return Post.objects.filter(status=Post.Status.PUBLISHED)[:20]
+
+    def item_title(self, item):
+        return item.title
+
+    def item_description(self, item):
+        return item.summary
+
+# urls.py
+path('feed/', LatestPostsFeed(), name='post-feed')
+```
+
+> **Why:** The Feed class handles XML escaping, RSS/Atom formats, enclosures, and item links via `get_absolute_url()`. Hand-rolled feed XML breaks on the first title containing `&` or `<`.
+
+### Legacy URLs (django.contrib.redirects)
+
+**Wrong:**
+```python
+# Hardcoding old→new URL redirects as views, one per moved page
+def old_about(request):
+    return redirect('/company/about/', permanent=True)
+```
+
+**Correct:**
+```python
+# settings.py
+INSTALLED_APPS = [..., 'django.contrib.sites', 'django.contrib.redirects']
+MIDDLEWARE = [..., 'django.contrib.redirects.middleware.RedirectFallbackMiddleware']
+# Then manage redirects as data in the admin — no deploy needed per redirect
+```
+
+> **Why:** The redirects app stores old→new URL mappings in the database and issues 301s via middleware only when a 404 would occur. Content editors can preserve SEO for moved pages without code changes.

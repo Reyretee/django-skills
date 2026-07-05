@@ -263,3 +263,45 @@ class Migration(migrations.Migration):
 ```
 
 > **Why:** Zero-downtime deployments require multi-step migrations: first make the field optional, deploy code that doesn't use it, then remove the column. Never drop a column that running code depends on.
+
+> **Note:** `null=True` on a CharField is normally an anti-pattern (see the null vs blank rule in models.md) — it's acceptable here only as a transitional step of a zero-downtime removal. The final state drops the field (or drops null), so the two-empty-states problem never ships as permanent schema.
+
+## AlterConstraint (Django 5.2+)
+
+**Wrong:**
+```python
+from django.db import migrations, models
+
+# Dropping and recreating a constraint just to rename or adjust it
+class Migration(migrations.Migration):
+    operations = [
+        migrations.RemoveConstraint(model_name='order', name='amount_gt_0'),
+        migrations.AddConstraint(
+            model_name='order',
+            constraint=models.CheckConstraint(
+                condition=models.Q(amount__gt=0),
+                name='order_amount_positive',
+            ),
+        ),
+        # Recreating revalidates every row and takes locks it doesn't need
+    ]
+```
+
+**Correct:**
+```python
+from django.db import migrations, models
+
+class Migration(migrations.Migration):
+    operations = [
+        migrations.AlterConstraint(
+            model_name='order',
+            name='amount_gt_0',
+            constraint=models.CheckConstraint(
+                condition=models.Q(amount__gt=0),
+                name='order_amount_positive',
+            ),
+        ),
+    ]
+```
+
+> **Why:** `AlterConstraint` (Django 5.2+) updates a constraint definition in place without dropping and recreating it, so the table isn't rescanned and the constraint never stops being enforced. Prefer it over Remove+Add pairs when renaming or tightening constraints in zero-downtime deployments.

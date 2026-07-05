@@ -1,0 +1,13 @@
+{
+  "name": "django-skills",
+  "description": "Django best practices skill, senior Django developer agent, and slash commands for reviewing, securing, and optimizing Django projects.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Ahmet Can Dinçer",
+    "url": "https://github.com/ahmetcdincer"
+  },
+  "homepage": "https://github.com/ahmetcdincer/django-skills",
+  "repository": "https://github.com/ahmetcdincer/django-skills",
+  "license": "MIT",
+  "keywords": ["django", "drf", "python", "best-practices", "orm", "security"]
+}

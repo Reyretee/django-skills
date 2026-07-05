@@ -65,6 +65,57 @@ Django Templates best practices: template inheritance, built-in tags and filters
 
 > **Why:** Template inheritance eliminates duplication. `base.html` defines the skeleton, child templates override specific blocks. Use `{% include %}` for reusable fragments.
 
+## Template Partials (Django 6.0)
+
+**Wrong:**
+```django
+<!-- todos/_todo_item.html — a separate include file for every snippet -->
+<li id="todo-{{ todo.pk }}">{{ todo.title }}</li>
+
+<!-- todos/list.html — fragment lives far from where it's used -->
+{% for todo in todos %}
+  {% include "todos/_todo_item.html" %}
+{% endfor %}
+```
+
+```python
+# views.py — returning the full page to an HTMX request
+def toggle_todo(request, pk):
+    todo = toggle(pk)
+    return render(request, 'todos/list.html', {'todos': Todo.objects.all()})
+    # HTMX only wanted the one <li> — the client swaps in a whole page
+```
+
+**Correct:**
+```django
+<!-- todos/list.html — fragment defined inline, right where it's used -->
+{% partialdef todo-item %}
+  <li id="todo-{{ todo.pk }}">{{ todo.title }}</li>
+{% endpartialdef %}
+
+{% block content %}
+  <ul>
+    {% for todo in todos %}
+      {% partial todo-item %}
+    {% endfor %}
+  </ul>
+{% endblock %}
+```
+
+```python
+# views.py — partials are addressable as "template.html#partial-name"
+# in render(), get_template(), and {% include %}
+def toggle_todo(request, pk):
+    todo = toggle(pk)
+    if request.headers.get('HX-Request'):
+        # Return just the fragment for the AJAX request
+        return render(request, 'todos/list.html#todo-item', {'todo': todo})
+    # Full page otherwise
+    return render(request, 'todos/list.html', {'todos': Todo.objects.all()})
+```
+
+> **Why:** Partials keep a fragment's markup in one place — no separate `_fragment.html` file per snippet, no duplicated markup — and make it addressable as `"list.html#todo-item"`, the canonical HTMX/AJAX pattern of returning just the fragment for partial-page swaps. On Django < 6.0, the `django-template-partials` package provides the same syntax.
+
 ## Template Tags
 
 **Wrong:**
@@ -101,7 +152,27 @@ Django Templates best practices: template inheritance, built-in tags and filters
 {% endwith %}
 ```
 
-> **Why:** `{% url %}` and `{% static %}` generate correct URLs regardless of deployment config. `{% empty %}` handles the no-results case. `{% with %}` caches computed values.
+> **Why:** `{% url %}` and `{% static %}` generate correct URLs regardless of deployment config. `{% empty %}` handles the no-results case. `{% with %}` caches computed values. Inside loops, use `forloop.counter`, `forloop.first`/`forloop.last`, and `forloop.length` (Django 6.0) instead of computing positions in the view.
+
+## {% querystring %} (Django 5.1+)
+
+**Wrong:**
+```django
+<!-- Hand-building the query string drops the user's active filters -->
+<a href="?page={{ page_obj.next_page_number }}">Next</a>
+<!-- On /products/?q=shoes&sort=price, clicking Next loses q and sort -->
+```
+
+**Correct:**
+```django
+<!-- Preserves all current GET params, replaces only page -->
+<a href="{% querystring page=page_obj.next_page_number %}">Next</a>
+
+<!-- Remove a parameter by setting it to None -->
+<a href="{% querystring q=None %}">Clear search</a>
+```
+
+> **Why:** `{% querystring %}` merges into the current request's GET parameters instead of replacing them, and handles URL encoding for you. As of Django 6.0 the output always starts with `?` and the tag also accepts multiple dict arguments.
 
 ## Template Filters
 
@@ -125,9 +196,14 @@ Django Templates best practices: template inheritance, built-in tags and filters
 <p>{{ price|floatformat:2 }}</p>
 <p>{{ name|default:"Anonymous" }}</p>
 <p>{{ count|pluralize:"y,ies" }}</p>
+
+<!-- django.contrib.humanize (add to INSTALLED_APPS) for friendly formatting -->
+{% load humanize %}
+<p>{{ view_count|intcomma }} views</p>
+<p>Posted {{ article.created_at|naturaltime }}</p>
 ```
 
-> **Why:** Template filters keep presentation logic in templates where it belongs. The view provides raw data, the template formats it for display.
+> **Why:** Template filters keep presentation logic in templates where it belongs. The view provides raw data, the template formats it for display. `django.contrib.humanize` adds human-friendly filters like `naturaltime` ("3 minutes ago") and `intcomma` ("1,234,567").
 
 ## Custom Template Tags
 
@@ -167,6 +243,12 @@ def recent_articles(count=5):
 @register.filter
 def currency(value):
     return f'${value:,.2f}'
+
+
+@register.simple_block_tag
+def alert(content, level='info'):
+    # Django 5.2+ — tags that wrap content, no full Node class needed
+    return mark_safe(f'<div class="alert alert-{level}">{content}</div>')
 ```
 
 ```html
@@ -174,9 +256,10 @@ def currency(value):
 <span>Cart: {% cart_count %}</span>
 {% recent_articles 3 %}
 <p>{{ product.price|currency }}</p>
+{% alert level="warning" %}Only {{ stock }} left in stock!{% endalert %}
 ```
 
-> **Why:** Custom tags and filters encapsulate reusable template logic. `simple_tag` for computed values, `inclusion_tag` for reusable template fragments, `filter` for value transformation.
+> **Why:** Custom tags and filters encapsulate reusable template logic. `simple_tag` for computed values, `inclusion_tag` for reusable template fragments, `filter` for value transformation, and `simple_block_tag` (Django 5.2+) for tags that wrap a block of rendered content — previously that required writing a full `Node` class.
 
 ## Context Processors
 
@@ -248,3 +331,43 @@ TEMPLATES = [
 ```
 
 > **Why:** Django's autoescaping prevents XSS by default. Never use `|safe` or `{% autoescape off %}` on user-supplied content. Sanitize HTML with a library like bleach before marking it safe.
+
+## Custom Error Pages
+
+**Wrong:**
+```html
+<!-- No custom templates — users see Django's bare default 404/500 pages
+     in production -->
+
+<!-- Or: templates/500.html depending on context processors -->
+{% extends "base.html" %}
+{% block content %}
+  <h1>{{ site_name }} is having trouble</h1>  <!-- Empty — never rendered -->
+  <p>Contact {{ support_email }}</p>          <!-- Also empty -->
+{% endblock %}
+```
+
+**Correct:**
+```html
+<!-- templates/404.html and templates/500.html are used automatically
+     when DEBUG=False — no configuration needed -->
+
+<!-- templates/500.html — must be fully self-contained -->
+<!DOCTYPE html>
+<html lang="en">
+<head><title>Server Error</title></head>
+<body>
+  <h1>Something went wrong</h1>
+  <p>We've been notified and are looking into it.</p>
+</body>
+</html>
+```
+
+```python
+# config/urls.py — handlers only needed for custom *views*
+# (extra context, content negotiation); not for plain templates
+handler404 = 'myapp.views.custom_404'
+handler500 = 'myapp.views.custom_500'
+```
+
+> **Why:** Django picks up `templates/404.html` and `templates/500.html` automatically when `DEBUG=False`; `handler404`/`handler500` in the root urls.py are only for custom view logic. The 500 template is rendered with an empty context — no context processors run — so it must not reference `{{ request }}`, `{{ site_name }}`, or anything else injected by them.

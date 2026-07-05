@@ -183,6 +183,42 @@ customers = Customer.objects.annotate(
 
 > **Why:** `aggregate()` produces a single summary dict. `annotate()` adds computed columns per row. Both execute in SQL — no Python-side iteration needed.
 
+## StringAgg and AnyValue (Django 6.0)
+
+**Wrong:**
+```python
+# Deprecated import — postgres-only, and its kwarg was `ordering`
+from django.contrib.postgres.aggregates import StringAgg
+
+# Or worse: fetching every row and string-joining in Python
+names = ', '.join(
+    p.name for p in Product.objects.filter(category_id=category_id)
+)
+```
+
+**Correct:**
+```python
+from django.db.models import AnyValue, Count, StringAgg, Value
+from myapp.models import Category
+
+# Comma-separated related names, computed in SQL — works on all databases
+categories = Category.objects.annotate(
+    product_names=StringAgg(
+        'products__name',
+        delimiter=Value(', '),
+        order_by='products__name',
+    ),
+)
+
+# AnyValue — pick a non-grouped column without adding it to GROUP BY
+report = Category.objects.values('parent_id').annotate(
+    product_count=Count('products'),
+    sample_name=AnyValue('name'),
+)
+```
+
+> **Why:** Django 6.0 promotes `StringAgg` to `django.db.models` and it works on all supported databases; the `django.contrib.postgres` version is deprecated, and its `ordering` kwarg is now `order_by`. `AnyValue` lets the database pick one representative value per group instead of post-processing rows in Python.
+
 ## Annotation with Subquery
 
 **Wrong:**
@@ -279,6 +315,55 @@ def get_stats():
 ```
 
 > **Why:** Never use string formatting with SQL. Always pass parameters separately so the database driver handles escaping. This is your primary defense against SQL injection.
+
+## PostgreSQL Full-Text Search
+
+**Wrong:**
+```python
+from myapp.models import Article
+
+# Sequential scan over large text columns — slow, no stemming, no ranking
+results = Article.objects.filter(body__icontains='django migrations')
+```
+
+**Correct:**
+```python
+from django.contrib.postgres.search import (
+    SearchQuery, SearchRank, SearchVector, TrigramSimilarity,
+)
+from myapp.models import Article
+
+# Ad-hoc search with ranking
+query = SearchQuery('django migrations')
+vector = SearchVector('title', weight='A') + SearchVector('body', weight='B')
+results = (
+    Article.objects
+    .annotate(rank=SearchRank(vector, query))
+    .filter(rank__gte=0.3)
+    .order_by('-rank')
+)
+
+# For real tables: persist the vector and index it
+from django.contrib.postgres.indexes import GinIndex
+from django.contrib.postgres.search import SearchVectorField
+
+class Article(models.Model):
+    ...
+    search_vector = SearchVectorField(null=True)
+
+    class Meta:
+        indexes = [GinIndex(fields=['search_vector'])]
+
+# Fuzzy matching for typos (requires the pg_trgm extension)
+results = (
+    Article.objects
+    .annotate(similarity=TrigramSimilarity('title', 'djnago'))
+    .filter(similarity__gt=0.3)
+    .order_by('-similarity')
+)
+```
+
+> **Why:** `icontains` can't use a normal B-tree index and does no stemming or relevance ranking. Postgres full-text search handles both, and a persistent `SearchVectorField` with a GIN index keeps it fast on real tables. Trigram similarity covers fuzzy/typo matching.
 
 ## select_related
 
@@ -417,6 +502,59 @@ def transfer_safe(from_id, to_id, amount):
 ```
 
 > **Why:** `atomic()` ensures all-or-nothing execution. `select_for_update()` locks rows to prevent concurrent modifications. Both are essential for financial operations.
+
+## select_for_update
+
+**Wrong:**
+```python
+from myapp.models import Account
+
+# Read-modify-write without a lock — two concurrent requests both read
+# the same balance, and one update silently overwrites the other
+def withdraw(account_id, amount):
+    account = Account.objects.get(pk=account_id)
+    if account.balance >= amount:
+        account.balance -= amount
+        account.save()
+```
+
+**Correct:**
+```python
+from django.db import transaction
+from django.db.models import F
+from myapp.models import Account, Job
+
+
+def withdraw(account_id, amount):
+    with transaction.atomic():  # select_for_update requires a transaction
+        # Row is locked until the transaction commits or rolls back
+        account = Account.objects.select_for_update().get(pk=account_id)
+        if account.balance < amount:
+            raise ValueError('Insufficient funds')
+        account.balance -= amount
+        account.save(update_fields=['balance'])
+
+
+# Work queue — skip rows other workers already locked
+def claim_next_job():
+    with transaction.atomic():
+        job = (
+            Job.objects
+            .select_for_update(skip_locked=True)
+            .filter(status='pending')
+            .order_by('created_at')
+            .first()
+        )
+        ...
+
+# nowait=True raises DatabaseError immediately instead of blocking
+# of=('self',) locks only this table's rows, not select_related JOINed rows
+
+# For a single-column atomic increment, prefer F() — no lock needed
+Account.objects.filter(pk=account_id).update(balance=F('balance') - amount)
+```
+
+> **Why:** `select_for_update()` takes a pessimistic row lock so concurrent transactions serialize instead of losing writes — it only works inside `transaction.atomic()`. Use `skip_locked=True` for work queues, `nowait=True` to fail fast, and `of=('self',)` to avoid locking rows JOINed via `select_related`. For simple single-column updates, `F()` expressions (or optimistic locking with a version field) avoid holding a lock entirely.
 
 ## N+1 Problem Detection and Solution
 

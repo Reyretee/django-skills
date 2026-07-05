@@ -144,6 +144,70 @@ def dashboard(request):
 
 > **Why:** `@cache_page` caches the entire response. Use it for public pages. For user-specific pages, add `@vary_on_cookie` so each user gets their own cache entry.
 
+## HTTP Caching & Conditional Processing
+
+**Wrong:**
+```python
+# Recomputing and re-sending a large response on every request,
+# even though the underlying data hasn't changed
+def report(request, pk):
+    report = Report.objects.get(pk=pk)
+    data = build_expensive_report(report)  # Rebuilt every time
+    return JsonResponse(data)  # Full payload re-sent even when unchanged
+```
+
+**Correct:**
+```python
+from django.views.decorators.http import condition, etag, last_modified
+
+
+def report_last_modified(request, pk):
+    # Cheap query — just the timestamp, not the whole report
+    return Report.objects.values_list('updated_at', flat=True).get(pk=pk)
+
+
+@condition(last_modified_func=report_last_modified)
+def report(request, pk):
+    # Only runs when the client's copy is stale — otherwise Django returns 304
+    report = Report.objects.get(pk=pk)
+    return JsonResponse(build_expensive_report(report))
+
+
+# @etag / @last_modified are shortcuts when you only need one validator
+@last_modified(report_last_modified)
+def report_v2(request, pk):
+    ...
+```
+
+```python
+# Per-view Cache-Control headers for browsers and CDNs
+from django.views.decorators.cache import cache_control, never_cache
+from django.views.decorators.vary import vary_on_cookie, vary_on_headers
+
+
+@cache_control(max_age=3600, public=True)  # Browsers/CDNs may cache for 1 hour
+def pricing_page(request):
+    ...
+
+
+@never_cache  # Cache-Control: no-store — for sensitive or always-fresh pages
+def account_settings(request):
+    ...
+
+
+@cache_control(max_age=300, private=True)
+@vary_on_cookie  # Cache key includes the Cookie header — one entry per user
+def dashboard(request):
+    ...
+
+
+@vary_on_headers('Accept-Language')  # Separate cache entries per language
+def localized_page(request):
+    ...
+```
+
+> **Why:** Server-side caching (above) saves work on your server; HTTP caching saves the round trip entirely. `@condition` sends a cheap 304 Not Modified when the client's copy is current — derive `Last-Modified` or an ETag from a lightweight query instead of rebuilding the response. `@cache_control` sets Cache-Control for browsers and CDNs; `@never_cache` opts sensitive pages out. Caution: caching authenticated responses without a `Vary` header leaks one user's page to another — any user-specific cached response needs `@vary_on_cookie` (or `private`/`no-store`).
+
 ## Template Fragment Cache
 
 **Wrong:**
